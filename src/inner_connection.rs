@@ -64,18 +64,19 @@ impl InnerConnection {
         c_path: &CStr,
         flags: OpenFlags,
         vfs: Option<&CStr>,
+        #[cfg(feature = "libsql-experimental")] wal: Option<&CStr>,
     ) -> Result<InnerConnection> {
         ensure_safe_sqlite_threading_mode()?;
 
         // Replicate the check for sane open flags from SQLite, because the check in
         // SQLite itself wasn't added until version 3.7.3.
-        debug_assert_eq!(1 << OpenFlags::SQLITE_OPEN_READ_ONLY.bits, 0x02);
-        debug_assert_eq!(1 << OpenFlags::SQLITE_OPEN_READ_WRITE.bits, 0x04);
+        debug_assert_eq!(1 << OpenFlags::SQLITE_OPEN_READ_ONLY.bits(), 0x02);
+        debug_assert_eq!(1 << OpenFlags::SQLITE_OPEN_READ_WRITE.bits(), 0x04);
         debug_assert_eq!(
-            1 << (OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE).bits,
+            1 << (OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE).bits(),
             0x40
         );
-        if (1 << (flags.bits & 0x7)) & 0x46 == 0 {
+        if (1 << (flags.bits() & 0x7)) & 0x46 == 0 {
             return Err(Error::SqliteFailure(
                 ffi::Error::new(ffi::SQLITE_MISUSE),
                 None,
@@ -87,9 +88,17 @@ impl InnerConnection {
             None => ptr::null(),
         };
 
+        #[cfg(feature = "libsql-experimental")]
+        let z_wal = wal
+            .map(|c_wal| c_wal.as_ptr())
+            .unwrap_or_else(std::ptr::null);
+
         unsafe {
             let mut db: *mut ffi::sqlite3 = ptr::null_mut();
+            #[cfg(not(feature = "libsql-experimental"))]
             let r = ffi::sqlite3_open_v2(c_path.as_ptr(), &mut db, flags.bits(), z_vfs);
+            #[cfg(feature = "libsql-experimental")]
+            let r = ffi::libsql_open(c_path.as_ptr(), &mut db, flags.bits(), z_vfs, z_wal);
             if r != ffi::SQLITE_OK {
                 let e = if db.is_null() {
                     error_from_sqlite_code(r, Some(c_path.to_string_lossy().to_string()))
@@ -125,7 +134,10 @@ impl InnerConnection {
                 return Err(e);
             }
 
-            Ok(InnerConnection::new(db, true))
+            let conn = InnerConnection::new(db, true);
+            #[cfg(feature = "libsql-wasm-experimental")]
+            conn.try_initialize_wasm_func_table().ok();
+            Ok(conn)
         }
     }
 
@@ -365,21 +377,18 @@ impl InnerConnection {
     pub fn release_memory(&self) -> Result<()> {
         self.decode_result(unsafe { ffi::sqlite3_db_release_memory(self.db) })
     }
+
+    #[cfg(feature = "libsql-wasm-experimental")]
+    pub fn try_initialize_wasm_func_table(&self) -> Result<()> {
+        self.decode_result(unsafe { ffi::libsql_try_initialize_wasm_func_table(self.db) })
+    }
 }
 
 impl Drop for InnerConnection {
     #[allow(unused_must_use)]
     #[inline]
     fn drop(&mut self) {
-        use std::thread::panicking;
-
-        if let Err(e) = self.close() {
-            if panicking() {
-                eprintln!("Error while closing SQLite connection: {e:?}");
-            } else {
-                panic!("Error while closing SQLite connection: {:?}", e);
-            }
-        }
+        self.close();
     }
 }
 

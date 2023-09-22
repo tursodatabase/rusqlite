@@ -15,6 +15,11 @@ use std::mem;
 
 mod error;
 
+#[cfg(feature = "libsql-wasm-experimental")]
+pub use libsql_wasm::{
+    libsql_compile_wasm_module, libsql_free_wasm_module, libsql_run_wasm, libsql_wasm_engine_new,
+};
+
 #[must_use]
 pub fn SQLITE_STATIC() -> sqlite3_destructor_type {
     None
@@ -30,9 +35,6 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindgen.rs"));
 }
 pub use bindings::*;
-
-pub type sqlite3_index_constraint = sqlite3_index_info_sqlite3_index_constraint;
-pub type sqlite3_index_constraint_usage = sqlite3_index_info_sqlite3_index_constraint_usage;
 
 impl Default for sqlite3_vtab {
     fn default() -> Self {

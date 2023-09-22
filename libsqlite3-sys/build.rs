@@ -36,7 +36,11 @@ fn main() {
             .expect("Could not copy bindings to output directory");
         return;
     }
-    if cfg!(all(
+
+    println!("cargo:rerun-if-env-changed=LIBSQLITE3_SYS_USE_PKG_CONFIG");
+    if env::var_os("LIBSQLITE3_SYS_USE_PKG_CONFIG").map_or(false, |s| s != "0") {
+        build_linked::main(&out_dir, &out_path);
+    } else if cfg!(all(
         feature = "sqlcipher",
         not(feature = "bundled-sqlcipher")
     )) {
@@ -52,17 +56,20 @@ fn main() {
     } else if cfg!(feature = "bundled")
         || (win_target() && cfg!(feature = "bundled-windows"))
         || cfg!(feature = "bundled-sqlcipher")
+        || cfg!(feature = "bundled-libsql-experimental")
     {
         #[cfg(any(
             feature = "bundled",
             feature = "bundled-windows",
-            feature = "bundled-sqlcipher"
+            feature = "bundled-sqlcipher",
+            feature = "bundled-libsql-experimental"
         ))]
         build_bundled::main(&out_dir, &out_path);
         #[cfg(not(any(
             feature = "bundled",
             feature = "bundled-windows",
-            feature = "bundled-sqlcipher"
+            feature = "bundled-sqlcipher",
+            feature = "bundled-libsql-experimental"
         )))]
         panic!("The runtime test should not run this branch, which has not compiled any logic.")
     } else {
@@ -73,7 +80,8 @@ fn main() {
 #[cfg(any(
     feature = "bundled",
     feature = "bundled-windows",
-    feature = "bundled-sqlcipher"
+    feature = "bundled-sqlcipher",
+    feature = "bundled-libsql-experimental"
 ))]
 mod build_bundled {
     use std::env;
@@ -128,6 +136,10 @@ mod build_bundled {
             .flag("-D_POSIX_THREAD_SAFE_FUNCTIONS") // cross compile with MinGW
             .warnings(false);
 
+        if cfg!(feature = "libsql-wasm-experimental") {
+            cfg.flag("-DLIBSQL_ENABLE_WASM_RUNTIME=1");
+        }
+
         if cfg!(feature = "bundled-sqlcipher") {
             cfg.flag("-DSQLITE_HAS_CODEC").flag("-DSQLITE_TEMP_STORE=2");
 
@@ -181,16 +193,10 @@ mod build_bundled {
                 cfg.include(env::var("DEP_OPENSSL_INCLUDE").unwrap());
                 // cargo will resolve downstream to the static lib in
                 // openssl-sys
-            } else if is_windows {
-                // Windows without `-vendored-openssl` takes this to link against a prebuilt
-                // OpenSSL lib
-                cfg.include(inc_dir.to_string_lossy().as_ref());
-                let lib = lib_dir.join("libcrypto.lib");
-                cfg.flag(lib.to_string_lossy().as_ref());
             } else if use_openssl {
                 cfg.include(inc_dir.to_string_lossy().as_ref());
-                // branch not taken on Windows, just `crypto` is fine.
-                println!("cargo:rustc-link-lib=dylib=crypto");
+                let lib_name = if is_windows { "libcrypto" } else { "crypto" };
+                println!("cargo:rustc-link-lib=dylib={}", lib_name);
                 println!("cargo:rustc-link-search={}", lib_dir.to_string_lossy());
             } else if is_apple {
                 cfg.flag("-DSQLCIPHER_CRYPTO_CC");
@@ -242,7 +248,7 @@ mod build_bundled {
             cfg.flag("-DHAVE_LOCALTIME_R");
         }
         // Target wasm32-wasi can't compile the default VFS
-        if is_compiler("wasm32-wasi") {
+        if env::var("TARGET").map_or(false, |v| v == "wasm32-wasi") {
             cfg.flag("-DSQLITE_OS_OTHER")
                 // https://github.com/rust-lang/rust/issues/74393
                 .flag("-DLONGDOUBLE_TYPE=double");
@@ -269,6 +275,11 @@ mod build_bundled {
             cfg.flag(&format!("-DSQLITE_MAX_EXPR_DEPTH={limit}"));
         }
         println!("cargo:rerun-if-env-changed=SQLITE_MAX_EXPR_DEPTH");
+
+        if let Ok(limit) = env::var("SQLITE_MAX_COLUMN") {
+            cfg.flag(&format!("-DSQLITE_MAX_COLUMN={limit}"));
+        }
+        println!("cargo:rerun-if-env-changed=SQLITE_MAX_COLUMN");
 
         if let Ok(extras) = env::var("LIBSQLITE3_FLAGS") {
             for extra in extras.split_whitespace() {
@@ -316,6 +327,11 @@ fn env_prefix() -> &'static str {
 fn lib_name() -> &'static str {
     if cfg!(any(feature = "sqlcipher", feature = "bundled-sqlcipher")) {
         "sqlcipher"
+    } else if cfg!(any(
+        feature = "libsql-experimental",
+        feature = "bundled-libsql-experimental"
+    )) {
+        "libsql"
     } else if cfg!(all(windows, feature = "winsqlite3")) {
         "winsqlite3"
     } else {
@@ -503,6 +519,11 @@ mod bindings {
                 None
             }
         }
+        fn item_name(&self, original_item_name: &str) -> Option<String> {
+            original_item_name
+                .strip_prefix("sqlite3_index_info_")
+                .map(|s| s.to_owned())
+        }
     }
 
     // Are we generating the bundled bindings? Used to avoid emitting things
@@ -524,7 +545,34 @@ mod bindings {
             .trust_clang_mangling(false)
             .header(header.clone())
             .parse_callbacks(Box::new(SqliteTypeChooser))
-            .rustfmt_bindings(true);
+            .blocklist_function("sqlite3_auto_extension")
+            .raw_line(
+                r#"extern "C" {
+    pub fn sqlite3_auto_extension(
+        xEntryPoint: ::std::option::Option<
+            unsafe extern "C" fn(
+                db: *mut sqlite3,
+                pzErrMsg: *mut *const ::std::os::raw::c_char,
+                pThunk: *const sqlite3_api_routines,
+            ) -> ::std::os::raw::c_int,
+        >,
+    ) -> ::std::os::raw::c_int;
+}"#,
+            )
+            .blocklist_function("sqlite3_cancel_auto_extension")
+            .raw_line(
+                r#"extern "C" {
+    pub fn sqlite3_cancel_auto_extension(
+        xEntryPoint: ::std::option::Option<
+            unsafe extern "C" fn(
+                db: *mut sqlite3,
+                pzErrMsg: *mut *const ::std::os::raw::c_char,
+                pThunk: *const sqlite3_api_routines,
+            ) -> ::std::os::raw::c_int,
+        >,
+    ) -> ::std::os::raw::c_int;
+}"#,
+            );
 
         if cfg!(any(feature = "sqlcipher", feature = "bundled-sqlcipher")) {
             bindings = bindings.clang_arg("-DSQLITE_HAS_CODEC");
